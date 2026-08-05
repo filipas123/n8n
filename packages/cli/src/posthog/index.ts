@@ -20,6 +20,19 @@ const POSTHOG_GROUP_TYPE_INSTANCE = 'company';
 
 const FLAGS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
+const SESSION_ID_MAX_LENGTH = 1000;
+
+/**
+ * The session ID arrives in a client-supplied header, so bound its length and
+ * drop anything outside printable ASCII before it reaches telemetry. Mirrors
+ * posthog-node's own tracing-header sanitization, which lives in a module the
+ * package does not export.
+ */
+function sanitizeSessionId(value: string | undefined): string | undefined {
+	const sanitized = value?.replace(/[^\x20-\x7E]/g, '').trim();
+	return sanitized ? sanitized.slice(0, SESSION_ID_MAX_LENGTH) : undefined;
+}
+
 interface CachedFlags {
 	flags: FeatureFlags;
 	expiresAt: number;
@@ -48,12 +61,26 @@ export class PostHogClient {
 		});
 	}
 
+	/**
+	 * Makes the browser's PostHog session ID available for the lifetime of the
+	 * request, so backend events captured while handling it are tied to the
+	 * originating session recording.
+	 *
+	 * Deliberately narrower than posthog-node's own `setupExpressRequestContext`,
+	 * which would also adopt the browser's distinct ID and attach `$ip` and
+	 * `$user_agent` to every backend event. We do not send that: `Telemetry.track`
+	 * deliberately overwrites the IP with `0.0.0.0` before it leaves the process.
+	 *
+	 * The cloud check is the enforcement point for a header any client can forge:
+	 * diagnostics default to n8n's own PostHog project, so a self-hosted instance
+	 * must never accept a session ID it cannot vouch for.
+	 */
 	setupExpressSessionContext(app: Application): void {
 		const postHog = this.postHog;
 		if (!postHog || this.globalConfig.deployment.type !== 'cloud') return;
 
 		app.use((req, _res, next) => {
-			const sessionId = req.get('x-posthog-session-id');
+			const sessionId = sanitizeSessionId(req.get('x-posthog-session-id'));
 			if (!sessionId) return next();
 
 			postHog.withContext({ sessionId }, next);
